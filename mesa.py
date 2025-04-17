@@ -71,7 +71,7 @@ class Mesa(EnsembleTrainingEnv):
         self.meta_sampler = SAC(state_size, action_space, self.args)
         self.env = EnsembleTrainingEnv(args, base_estimator)
         self.memory = ReplayMemory(self.args.replay_size)
-    
+
     def meta_fit(self, X_train, y_train, X_valid, y_valid, X_test=None, y_test=None):
         """Meta-training process of MESA.
         
@@ -106,6 +106,11 @@ class Mesa(EnsembleTrainingEnv):
         self.scores = []
         total_steps = self.args.update_steps + self.args.start_steps
         num_steps, num_updates, num_episodes = 0, 0, 0
+
+        # Early stopping variables
+        best_valid_score = -float('inf') 
+        episodes_no_improve = 0 
+        patience = 50
 
         # start meta-training
         while num_steps < total_steps:
@@ -142,9 +147,29 @@ class Mesa(EnsembleTrainingEnv):
                 if done:
                     num_episodes += 1
                     self.record_scores()
-                    # record print mean score of latest args.meta_verbose_mean_episodes to stdout
                     self.verbose_mean_scores(num_episodes, num_updates, by)
 
+                    # Early stopping logic
+                    current_valid_score = self.env.rater.score(self.env.y_valid, self.env.y_pred_valid_buffer)
+                    if current_valid_score > best_valid_score:
+                        best_valid_score = current_valid_score
+                        episodes_no_improve = 0
+                        if self.args.meta_verbose is 'full':
+                            print(f"New best validation score: {best_valid_score:.3f}")
+                    else:
+                        episodes_no_improve += 1
+                        if self.args.meta_verbose is 'full':
+                            print(f"No improvement for {episodes_no_improve}/{patience} episodes, current best: {best_valid_score:.3f}")
+
+                    # Check if we should stop early
+                    if episodes_no_improve >= patience:
+                        print(f"Early stopping triggered after {num_episodes} episodes. Best validation score: {best_valid_score:.3f}")
+                        break
+
+            if episodes_no_improve >= patience:
+                break
+
+        self.estimators_ = self.env.estimators_
         return self
     
     def record_scores(self):
@@ -174,13 +199,22 @@ class Mesa(EnsembleTrainingEnv):
         if self.args.meta_verbose is 'full' or (self.args.meta_verbose != 0 and num_episodes % self.args.meta_verbose == 0):
             view_bound = max(-self.args.meta_verbose_mean_episodes, -len(self.scores))
             recent_scores_mean = np.array(self.scores)[view_bound:].mean(axis=0)
-            print ('Epi.{:<4d} updates {:<4d} |last-{}-mean-{}| train {:.3f} | valid {:.3f} | test {:.3f} | by {}'.format(
-                num_episodes, num_updates, self.args.meta_verbose_mean_episodes, self.args.metric, 
-                recent_scores_mean[0], recent_scores_mean[1], recent_scores_mean[2], by))
+            # 檢查 X_test 和 y_test 是否為 None
+            if len(recent_scores_mean)<3:
+                # 只打印 train 和 valid 分數
+                print('Epi.{:<4d} updates {:<4d} |last-{}-mean-{}| train {:.3f} | valid {:.3f} | by {}'.format(
+                    num_episodes, num_updates, self.args.meta_verbose_mean_episodes, self.args.metric, 
+                    recent_scores_mean[0], recent_scores_mean[1], by))
+            else:
+                # 打印 train、valid 和 test 分數
+                print('Epi.{:<4d} updates {:<4d} |last-{}-mean-{}| train {:.3f} | valid {:.3f} | test {:.3f} | by {}'.format(
+                    num_episodes, num_updates, self.args.meta_verbose_mean_episodes, self.args.metric, 
+                    recent_scores_mean[0], recent_scores_mean[1], recent_scores_mean[2], by))
+        
         return
 
     def fit(self, X, y, X_valid, y_valid, n_estimators=None, verbose=False):
-        """Build a MESA ensemble from training set (X, y) and validation set (X_valid, y_valid).
+        '''Build a MESA ensemble from training set (X, y) and validation set (X_valid, y_valid).
 
         Parameters
         ----------
@@ -205,7 +239,7 @@ class Mesa(EnsembleTrainingEnv):
         Returns
         ----------
         self : object (Mesa)
-        """
+        '''
         n_estimators = self.n_estimators if n_estimators is None else n_estimators
         self.load_data(X, y, X_valid, y_valid)
         self.init()
@@ -218,7 +252,7 @@ class Mesa(EnsembleTrainingEnv):
             if verbose: 
                 print ('{:<12s} | action: {} {}'.format('Mesa', action, info))
         return self
-    
+
     def save_meta_sampler(self, directory='save_model', suffix='meta_sampler'):
         """Save trained meta-sampler to files.
 
@@ -257,3 +291,14 @@ class Mesa(EnsembleTrainingEnv):
         critic_path = f'{directory_path}critic_{suffix}'
         self.meta_sampler.load_model(actor_path, critic_path)
         return self
+    
+    def predict_proba(self, X):
+        if not hasattr(self, 'estimators_') or not self.estimators_:
+            raise ValueError("MESA model has not been fitted yet.")
+        probas = np.array([estimator.predict_proba(X) for estimator in self.estimators_])
+        mean_probas = np.mean(probas, axis=0)
+        return mean_probas
+
+    def predict(self, X):
+        probas = self.predict_proba(X)
+        return (probas[:, 1] > 0.5).astype(int)         
